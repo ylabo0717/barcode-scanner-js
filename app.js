@@ -9,6 +9,7 @@ const statusEl = document.querySelector('#status');
 const textBoxEl = document.querySelector('#detected-values');
 const resultListEl = document.querySelector('#detected-list');
 const clearButtonEl = document.querySelector('#clear-results');
+const videoWrapperEl = document.querySelector('.video-wrapper');
 
 const DETECTION_INTERVAL_MS = 250;
 const RESULT_TTL_MS = 8000;
@@ -18,6 +19,132 @@ let detectionTimer = null;
 let activeDetector = null;
 let detectorReady = null;
 let lastResults = new Map();
+let lastOverlayWidth = 0;
+let lastOverlayHeight = 0;
+let lastOverlayDpr = 0;
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getOverlayMetrics() {
+  const videoWidth = videoEl.videoWidth;
+  const videoHeight = videoEl.videoHeight;
+  const overlayWidth = overlayEl.clientWidth;
+  const overlayHeight = overlayEl.clientHeight;
+
+  if (!videoWidth || !videoHeight || !overlayWidth || !overlayHeight) {
+    return null;
+  }
+
+  const scale = Math.max(overlayWidth / videoWidth, overlayHeight / videoHeight);
+  const displayedWidth = videoWidth * scale;
+  const displayedHeight = videoHeight * scale;
+  const offsetX = (overlayWidth - displayedWidth) / 2;
+  const offsetY = (overlayHeight - displayedHeight) / 2;
+
+  return { scale, offsetX, offsetY, overlayWidth, overlayHeight };
+}
+
+function clearOverlay() {
+  overlayCtx.save();
+  overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+  overlayCtx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  overlayCtx.restore();
+}
+
+function convertPointsToOverlay(points) {
+  const metrics = getOverlayMetrics();
+  if (!metrics || !Array.isArray(points) || points.length === 0) {
+    return null;
+  }
+
+  const converted = [];
+
+  for (const point of points) {
+    const x = point?.x ?? point?.getX?.();
+    const y = point?.y ?? point?.getY?.();
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
+    converted.push({
+      x: x * metrics.scale + metrics.offsetX,
+      y: y * metrics.scale + metrics.offsetY,
+    });
+  }
+
+  return converted.length ? converted : null;
+}
+
+function getBoundingRectFromPoints(points) {
+  if (!Array.isArray(points) || points.length === 0) {
+    return null;
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const point of points) {
+    if (!point) continue;
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+    return null;
+  }
+
+  return {
+    x: minX,
+    y: minY,
+    width: Math.max(1, maxX - minX),
+    height: Math.max(1, maxY - minY),
+  };
+}
+
+function convertBoxToOverlay(box) {
+  const metrics = getOverlayMetrics();
+  if (!metrics || !box) {
+    return null;
+  }
+
+  const rawX = box.x * metrics.scale + metrics.offsetX;
+  const rawY = box.y * metrics.scale + metrics.offsetY;
+  const rawWidth = box.width * metrics.scale;
+  const rawHeight = box.height * metrics.scale;
+
+  if ([rawX, rawY, rawWidth, rawHeight].some((value) => !Number.isFinite(value))) {
+    return null;
+  }
+
+  const startX = rawWidth >= 0 ? rawX : rawX + rawWidth;
+  const endX = rawWidth >= 0 ? rawX + rawWidth : rawX;
+  const startY = rawHeight >= 0 ? rawY : rawY + rawHeight;
+  const endY = rawHeight >= 0 ? rawY + rawHeight : rawY;
+
+  const clampedStartX = clamp(startX, 0, metrics.overlayWidth);
+  const clampedEndX = clamp(endX, 0, metrics.overlayWidth);
+  const clampedStartY = clamp(startY, 0, metrics.overlayHeight);
+  const clampedEndY = clamp(endY, 0, metrics.overlayHeight);
+
+  const width = clampedEndX - clampedStartX;
+  const height = clampedEndY - clampedStartY;
+
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+
+  return {
+    x: clampedStartX,
+    y: clampedStartY,
+    width: Math.max(1, width),
+    height: Math.max(1, height),
+  };
+}
 
 class NativeBarcodeDetector {
   constructor(formats) {
@@ -32,16 +159,32 @@ class NativeBarcodeDetector {
 
     try {
       const rawResults = await this.detector.detect(video);
-      return rawResults.map((result) => ({
-        rawValue: result.rawValue,
-        format: result.format || 'unknown',
-        box: {
-          x: result.boundingBox?.x ?? 0,
-          y: result.boundingBox?.y ?? 0,
-          width: result.boundingBox?.width ?? video.videoWidth,
-          height: result.boundingBox?.height ?? video.videoHeight,
-        },
-      }));
+      return rawResults.map((result) => {
+        const cornerPoints = Array.isArray(result.cornerPoints)
+          ? result.cornerPoints
+              .map((point) => {
+                const x = point?.x ?? point?.[0];
+                const y = point?.y ?? point?.[1];
+                if (!Number.isFinite(x) || !Number.isFinite(y)) {
+                  return null;
+                }
+                return { x, y };
+              })
+              .filter(Boolean)
+          : null;
+
+        return {
+          rawValue: result.rawValue,
+          format: result.format || 'unknown',
+          box: {
+            x: result.boundingBox?.x ?? 0,
+            y: result.boundingBox?.y ?? 0,
+            width: result.boundingBox?.width ?? video.videoWidth,
+            height: result.boundingBox?.height ?? video.videoHeight,
+          },
+          points: cornerPoints && cornerPoints.length ? cornerPoints : null,
+        };
+      });
     } catch (error) {
       if (error?.name === 'InvalidStateError' || error?.name === 'TypeError') {
         return [];
@@ -144,13 +287,24 @@ class ZXingBarcodeDetector {
   }
 
   _mapResult(result, fallbackWidth, fallbackHeight) {
-    const points = result.getResultPoints?.() ?? [];
+    const rawPoints = result.getResultPoints?.() ?? [];
+    const points = rawPoints
+      .map((point) => {
+        const x = point?.getX?.();
+        const y = point?.getY?.();
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          return null;
+        }
+        return { x, y };
+      })
+      .filter(Boolean);
     const box = this._pointsToRect(points, fallbackWidth, fallbackHeight);
 
     return {
       rawValue: result.getText?.() ?? '',
       format: this._formatToString(result.getBarcodeFormat?.()),
       box,
+      points,
     };
   }
 
@@ -166,8 +320,8 @@ class ZXingBarcodeDetector {
 
     for (const point of points) {
       if (!point) continue;
-      const x = point.getX?.();
-      const y = point.getY?.();
+      const x = point?.x ?? point?.getX?.();
+      const y = point?.y ?? point?.getY?.();
       if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
       minX = Math.min(minX, x);
       minY = Math.min(minY, y);
@@ -314,11 +468,40 @@ async function ensureVideoIsPlaying() {
 }
 
 function resizeOverlay() {
-  const width = videoEl.videoWidth;
-  const height = videoEl.videoHeight;
-  if (!width || !height) return;
+  if (videoWrapperEl) {
+    const intrinsicWidth = videoEl.videoWidth;
+    const intrinsicHeight = videoEl.videoHeight;
+    if (intrinsicWidth && intrinsicHeight) {
+      const aspect = `${intrinsicWidth} / ${intrinsicHeight}`;
+      if (videoWrapperEl.style.aspectRatio !== aspect) {
+        videoWrapperEl.style.aspectRatio = aspect;
+      }
+    } else if (videoWrapperEl.style.aspectRatio) {
+      videoWrapperEl.style.aspectRatio = '';
+    }
+  }
+
+  const rect = videoEl.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.round(rect.width * dpr);
+  const height = Math.round(rect.height * dpr);
+
+  if (!width || !height) {
+    return;
+  }
+
+  if (width === lastOverlayWidth && height === lastOverlayHeight && dpr === lastOverlayDpr) {
+    return;
+  }
+
+  lastOverlayWidth = width;
+  lastOverlayHeight = height;
+  lastOverlayDpr = dpr;
+
   overlayEl.width = width;
   overlayEl.height = height;
+  overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  clearOverlay();
 }
 
 async function populateCameraOptions() {
@@ -383,7 +566,7 @@ function stopDetectionLoop() {
     clearTimeout(detectionTimer);
     detectionTimer = null;
   }
-  overlayCtx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  clearOverlay();
 }
 
 function updateResults(detections) {
@@ -414,7 +597,8 @@ function updateResults(detections) {
 }
 
 function renderResults() {
-  overlayCtx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  resizeOverlay();
+  clearOverlay();
 
   const ordered = Array.from(lastResults.values()).sort((a, b) => b.lastSeen - a.lastSeen);
   const lines = [];
@@ -446,8 +630,14 @@ function renderResults() {
 }
 
 function drawBoundingBox(result, index) {
-  const { box } = result;
-  if (!box) return;
+  const displayPoints = convertPointsToOverlay(result.points);
+  let displayBox = convertBoxToOverlay(result.box);
+
+  if ((!displayBox || !displayBox.width || !displayBox.height) && displayPoints) {
+    displayBox = getBoundingRectFromPoints(displayPoints);
+  }
+
+  if (!displayBox) return;
 
   const hue = (index * 57) % 360;
   const strokeStyle = `hsl(${hue} 85% 65%)`;
@@ -458,18 +648,30 @@ function drawBoundingBox(result, index) {
   overlayCtx.fillStyle = fillStyle;
   overlayCtx.lineWidth = 3;
   overlayCtx.beginPath();
-  overlayCtx.roundRect?.(box.x, box.y, box.width, box.height, 12);
-  if (!overlayCtx.roundRect) {
-    overlayCtx.rect(box.x, box.y, box.width, box.height);
+
+  if (displayPoints && displayPoints.length >= 3) {
+    overlayCtx.moveTo(displayPoints[0].x, displayPoints[0].y);
+    for (let i = 1; i < displayPoints.length; i += 1) {
+      overlayCtx.lineTo(displayPoints[i].x, displayPoints[i].y);
+    }
+    overlayCtx.closePath();
+    overlayCtx.fill();
+    overlayCtx.stroke();
+  } else {
+    overlayCtx.roundRect?.(displayBox.x, displayBox.y, displayBox.width, displayBox.height, 12);
+    if (!overlayCtx.roundRect) {
+      overlayCtx.rect(displayBox.x, displayBox.y, displayBox.width, displayBox.height);
+    }
+    overlayCtx.fill();
+    overlayCtx.stroke();
   }
-  overlayCtx.fill();
-  overlayCtx.stroke();
 
   overlayCtx.fillStyle = strokeStyle;
   overlayCtx.font = '16px system-ui, sans-serif';
   overlayCtx.textBaseline = 'top';
   const label = result.rawValue ? `${result.rawValue}` : '(値なし)';
-  overlayCtx.fillText(label, box.x + 8, Math.max(0, box.y - 22));
+  const textY = displayBox.y - 22 >= 0 ? displayBox.y - 22 : displayBox.y + displayBox.height + 4;
+  overlayCtx.fillText(label, displayBox.x + 8, textY);
   overlayCtx.restore();
 }
 
@@ -542,6 +744,7 @@ async function bootstrap() {
   }
 
   videoEl.addEventListener('loadedmetadata', resizeOverlay);
+  window.addEventListener('resize', resizeOverlay);
 
   startButtonEl.addEventListener('click', handleStart);
   stopButtonEl.addEventListener('click', handleStop);
