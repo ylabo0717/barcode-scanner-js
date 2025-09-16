@@ -9,11 +9,10 @@
   <body>
     <header class="page-header">
       <h1>バーコードスキャナー 0.0.1</h1>
-      <p class="page-subtitle">カメラを利用して複数バーコードを同時に検出します。</p>
     </header>
 
     <main class="layout">
-      <section class="preview-panel">
+      <section class="scanner-panel">
         <div class="video-wrapper">
           <video id="preview" playsinline autoplay muted></video>
           <canvas id="overlay"></canvas>
@@ -21,26 +20,22 @@
             カメラ利用が許可されていません。ブラウザの設定を確認してください。
           </div>
         </div>
+        <textarea
+          id="detected-values"
+          class="results-textarea"
+          readonly
+          placeholder="検出結果がここに表示されます"
+        ></textarea>
         <div class="controls">
-          <label class="control">
-            カメラ
-            <select id="camera-select"></select>
-          </label>
           <div class="button-row">
             <button id="start-button" type="button">開始</button>
             <button id="stop-button" type="button" disabled>停止</button>
+            <button id="clear-results" type="button">クリア</button>
           </div>
+          <select id="camera-select" aria-label="使用するカメラ"></select>
           <output id="status" class="status">準備完了</output>
         </div>
-      </section>
-
-      <section class="results-panel">
-        <h2>検出結果</h2>
-        <textarea id="detected-values" readonly placeholder="検出結果がここに表示されます"></textarea>
         <ul id="detected-list" class="result-list"></ul>
-        <div class="actions">
-          <button id="clear-results" type="button">結果をクリア</button>
-        </div>
       </section>
     </main>
 
