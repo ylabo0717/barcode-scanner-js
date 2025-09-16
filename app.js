@@ -28,6 +28,7 @@ let lastOverlayDpr = 0;
 const detectorCache = new Map();
 const detectorAvailability = new Map(DETECTOR_DEFINITIONS.map(({ id }) => [id, false]));
 let selectedAlgorithm = null;
+let activeCameraDeviceId = null;
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -523,6 +524,11 @@ async function initCamera(deviceId) {
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
   assignStream(stream);
 
+  const [videoTrack] = stream.getVideoTracks();
+  const trackSettings = videoTrack?.getSettings?.() ?? {};
+  activeCameraDeviceId =
+    (typeof deviceId === 'string' && deviceId) || trackSettings.deviceId || activeCameraDeviceId;
+
   await ensureVideoCanPlay();
   await ensureVideoIsPlaying();
   resizeOverlay();
@@ -638,9 +644,20 @@ async function populateCameraOptions() {
     cameraSelectEl.append(option);
   }
 
-  if (currentValue && cameraSelectEl.querySelector(`option[value="${currentValue}"]`)) {
-    cameraSelectEl.value = currentValue;
+  let desiredValue = activeCameraDeviceId || currentValue;
+  if (!desiredValue && videoDevices.length > 0) {
+    desiredValue = videoDevices[0].deviceId;
   }
+
+  if (desiredValue && cameraSelectEl.querySelector(`option[value="${desiredValue}"]`)) {
+    cameraSelectEl.value = desiredValue;
+  } else if (videoDevices.length > 0) {
+    cameraSelectEl.value = videoDevices[0].deviceId;
+  } else {
+    cameraSelectEl.value = '';
+  }
+
+  activeCameraDeviceId = cameraSelectEl.value || activeCameraDeviceId;
 }
 
 function startDetectionLoop() {
