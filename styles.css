@@ -128,6 +128,7 @@ video {
   visibility: hidden;
 }
 
+
 .controls {
   display: flex;
   flex-direction: column;
@@ -190,7 +191,7 @@ button:not(:disabled):hover {
   margin: 0;
 }
 
-select#camera-select {
+.controls select {
   width: 100%;
 }
 

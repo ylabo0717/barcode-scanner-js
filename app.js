@@ -9,19 +9,25 @@ const statusEl = document.querySelector('#status');
 const textBoxEl = document.querySelector('#detected-values');
 const resultListEl = document.querySelector('#detected-list');
 const clearButtonEl = document.querySelector('#clear-results');
+const algorithmSelectEl = document.querySelector('#algorithm-select');
 const videoWrapperEl = document.querySelector('.video-wrapper');
 
 const DETECTION_INTERVAL_MS = 250;
 const RESULT_TTL_MS = 8000;
+const DETECTOR_DEFINITIONS = [
+  { id: 'native', label: 'BarcodeDetector' },
+  { id: 'zxing', label: 'ZXing' },
+];
 
 let mediaStream = null;
 let detectionTimer = null;
-let activeDetector = null;
-let detectorReady = null;
 let lastResults = new Map();
 let lastOverlayWidth = 0;
 let lastOverlayHeight = 0;
 let lastOverlayDpr = 0;
+const detectorCache = new Map();
+const detectorAvailability = new Map(DETECTOR_DEFINITIONS.map(({ id }) => [id, false]));
+let selectedAlgorithm = null;
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -370,30 +376,133 @@ class ZXingBarcodeDetector {
   }
 }
 
-async function createDetector() {
-  if ('BarcodeDetector' in window) {
+async function createDetectorByType(type) {
+  if (type === 'native') {
+    if (!('BarcodeDetector' in window)) {
+      throw new Error('BarcodeDetector API は利用できません');
+    }
+
+    let supportedFormats = [];
     try {
-      const supportedFormats = await (window.BarcodeDetector.getSupportedFormats?.() ?? []);
+      supportedFormats = await (window.BarcodeDetector.getSupportedFormats?.() ?? []);
+    } catch (error) {
+      console.warn('BarcodeDetector の対応フォーマット取得に失敗しました', error);
+    }
+
+    try {
       return new NativeBarcodeDetector(supportedFormats);
     } catch (error) {
-      console.warn('BarcodeDetector API is present but failed to initialise, falling back to ZXing.', error);
+      throw new Error(`BarcodeDetector の初期化に失敗しました: ${error?.message || error}`);
     }
   }
 
-  const zxing = await import('https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/+esm');
-  return new ZXingBarcodeDetector(zxing);
+  if (type === 'zxing') {
+    const zxing = await import('https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/+esm');
+    return new ZXingBarcodeDetector(zxing);
+  }
+
+  throw new Error(`未知の検出アルゴリズムです: ${type}`);
 }
 
-async function ensureDetector() {
-  if (!detectorReady) {
-    detectorReady = createDetector();
+async function ensureDetector(type) {
+  if (!type) {
+    return null;
   }
 
-  if (!activeDetector) {
-    activeDetector = await detectorReady;
+  if (detectorCache.has(type)) {
+    return detectorCache.get(type);
   }
 
-  return activeDetector;
+  const detector = await createDetectorByType(type);
+  detectorCache.set(type, detector);
+  return detector;
+}
+
+function getAlgorithmLabel(type) {
+  const entry = DETECTOR_DEFINITIONS.find((definition) => definition.id === type);
+  return entry?.label ?? type;
+}
+
+function updateAlgorithmSelectOptions() {
+  if (!algorithmSelectEl) {
+    return;
+  }
+
+  const currentValue = algorithmSelectEl.value;
+  algorithmSelectEl.innerHTML = '';
+  let availableCount = 0;
+
+  DETECTOR_DEFINITIONS.forEach(({ id, label }) => {
+    const option = document.createElement('option');
+    option.value = id;
+    const available = detectorAvailability.get(id);
+    option.textContent = available ? label : `${label} (未対応)`;
+    option.disabled = !available;
+    if (available) {
+      availableCount += 1;
+    }
+    algorithmSelectEl.append(option);
+  });
+
+  if (selectedAlgorithm && detectorAvailability.get(selectedAlgorithm)) {
+    algorithmSelectEl.value = selectedAlgorithm;
+  } else if (detectorAvailability.get(currentValue)) {
+    selectedAlgorithm = currentValue;
+    algorithmSelectEl.value = currentValue;
+  } else {
+    const fallback = DETECTOR_DEFINITIONS.find(({ id }) => detectorAvailability.get(id));
+    selectedAlgorithm = fallback?.id ?? null;
+    algorithmSelectEl.value = selectedAlgorithm ?? '';
+  }
+
+  if (!selectedAlgorithm) {
+    algorithmSelectEl.value = '';
+  }
+
+  algorithmSelectEl.disabled = availableCount <= 1;
+}
+
+async function prepareDetectorOptions() {
+  for (const { id } of DETECTOR_DEFINITIONS) {
+    let available = false;
+    try {
+      const detector = await ensureDetector(id);
+      if (detector) {
+        available = true;
+      }
+    } catch (error) {
+      detectorCache.delete(id);
+      console.warn(`${getAlgorithmLabel(id)} は利用できません`, error);
+    }
+    detectorAvailability.set(id, available);
+  }
+
+  if (!selectedAlgorithm || !detectorAvailability.get(selectedAlgorithm)) {
+    const fallback = DETECTOR_DEFINITIONS.find(({ id }) => detectorAvailability.get(id));
+    selectedAlgorithm = fallback?.id ?? null;
+  }
+
+  updateAlgorithmSelectOptions();
+}
+
+async function ensureActiveDetector() {
+  if (!selectedAlgorithm) {
+    return null;
+  }
+
+  if (!detectorAvailability.get(selectedAlgorithm)) {
+    return null;
+  }
+
+  try {
+    return await ensureDetector(selectedAlgorithm);
+  } catch (error) {
+    console.error(`${getAlgorithmLabel(selectedAlgorithm)} の初期化に失敗しました`, error);
+    detectorCache.delete(selectedAlgorithm);
+    detectorAvailability.set(selectedAlgorithm, false);
+    updateAlgorithmSelectOptions();
+    return null;
+  }
 }
 
 async function initCamera(deviceId) {
@@ -546,13 +655,20 @@ function startDetectionLoop() {
       return;
     }
 
-    try {
-      const detector = await ensureDetector();
-      const detections = await detector.detect(videoEl);
-      updateResults(detections);
-    } catch (error) {
-      console.error('Detection loop error', error);
-      statusEl.value = '検出エラーが発生しました';
+    const detector = await ensureActiveDetector();
+
+    if (!detector) {
+      if (statusEl.value !== '選択したアルゴリズムが利用できません') {
+        statusEl.value = '選択したアルゴリズムが利用できません';
+      }
+    } else {
+      try {
+        const detections = await detector.detect(videoEl);
+        updateResults(detections);
+      } catch (error) {
+        console.error('Detection loop error', error);
+        statusEl.value = '検出エラーが発生しました';
+      }
     }
 
     detectionTimer = window.setTimeout(tick, DETECTION_INTERVAL_MS);
@@ -689,10 +805,17 @@ async function handleStart() {
   statusEl.value = 'カメラ初期化中…';
 
   try {
-    await ensureDetector();
+    const detector = await ensureActiveDetector();
+    if (!detector) {
+      statusEl.value = '利用可能な検出アルゴリズムがありません';
+      startButtonEl.disabled = false;
+      stopButtonEl.disabled = true;
+      return;
+    }
+
     const stream = await initCamera(cameraSelectEl.value || undefined);
     if (stream) {
-      statusEl.value = '検出を開始しました';
+      statusEl.value = `${getAlgorithmLabel(selectedAlgorithm)} で検出を開始しました`;
       startDetectionLoop();
     }
   } catch (error) {
@@ -724,6 +847,27 @@ async function handleCameraChange() {
   }
 }
 
+function handleAlgorithmChange() {
+  if (!algorithmSelectEl) {
+    return;
+  }
+
+  const next = algorithmSelectEl.value;
+  if (!next) {
+    return;
+  }
+
+  if (!detectorAvailability.get(next)) {
+    statusEl.value = `${getAlgorithmLabel(next)} は利用できません`;
+    updateAlgorithmSelectOptions();
+    return;
+  }
+
+  selectedAlgorithm = next;
+  const label = getAlgorithmLabel(next);
+  statusEl.value = startButtonEl.disabled ? `${label} に切り替えました` : `${label} を選択しました`;
+}
+
 function handleClearResults() {
   lastResults = new Map();
   renderResults();
@@ -743,12 +887,20 @@ async function bootstrap() {
     console.warn('カメラリスト取得に失敗', error);
   }
 
+  try {
+    await prepareDetectorOptions();
+  } catch (error) {
+    console.warn('検出アルゴリズムの初期化に失敗', error);
+    updateAlgorithmSelectOptions();
+  }
+
   videoEl.addEventListener('loadedmetadata', resizeOverlay);
   window.addEventListener('resize', resizeOverlay);
 
   startButtonEl.addEventListener('click', handleStart);
   stopButtonEl.addEventListener('click', handleStop);
   cameraSelectEl.addEventListener('change', handleCameraChange);
+  algorithmSelectEl?.addEventListener('change', handleAlgorithmChange);
   clearButtonEl.addEventListener('click', handleClearResults);
 
   document.addEventListener('visibilitychange', () => {
