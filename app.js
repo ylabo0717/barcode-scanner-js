@@ -460,7 +460,7 @@ function updateAlgorithmSelectOptions() {
     algorithmSelectEl.value = '';
   }
 
-  algorithmSelectEl.disabled = availableCount <= 1;
+  algorithmSelectEl.disabled = availableCount === 0;
 }
 
 async function prepareDetectorOptions() {
